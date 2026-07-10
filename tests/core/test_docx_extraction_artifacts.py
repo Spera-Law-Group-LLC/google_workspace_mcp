@@ -202,6 +202,18 @@ def test_docx_zip_member_size_is_checked_before_read(monkeypatch):
     assert result is None or "skipped" in result.lower() or "too large" in result.lower()
 
 
+def test_docx_zip_compression_ratio_is_checked_before_read(monkeypatch):
+    class HighRatioZipFile(_FakeZipFile):
+        file_size = 4 * 1024 * 1024
+        compress_size = 70 * 1024
+
+    monkeypatch.setattr(utils.zipfile, "ZipFile", HighRatioZipFile)
+
+    result = utils.extract_office_xml_text(b"synthetic zip bytes", DOCX_MIME)
+
+    assert result is None or "skipped" in result.lower() or "compression" in result.lower()
+
+
 def test_docx_zip_zero_compressed_nonzero_uncompressed_member_is_rejected(monkeypatch):
     class ZeroCompressedZipFile(_FakeZipFile):
         file_size = 1024 * 1024
