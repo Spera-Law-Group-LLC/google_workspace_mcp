@@ -8,6 +8,9 @@ import io
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
 
 from core import utils
 
@@ -48,6 +51,26 @@ def _r_preserve(text: str) -> str:
 def _content(result: str) -> str:
     marker = "--- CONTENT ---"
     return result.split(marker, 1)[1].strip() if marker in result else result.strip()
+
+
+def _unwrap(tool):
+    fn = tool.fn if hasattr(tool, "fn") else tool
+    while hasattr(fn, "__wrapped__"):
+        fn = fn.__wrapped__
+    return fn
+
+
+class _FakeDownloader:
+    def __init__(self, fh, _request_obj, payload):
+        self.fh = fh
+        self.payload = payload
+        self.done = False
+
+    def next_chunk(self):
+        if not self.done:
+            self.fh.write(self.payload)
+            self.done = True
+        return None, True
 
 
 def test_docx_run_boundaries_do_not_insert_spaces_or_strip_punctuation():
@@ -202,3 +225,65 @@ def test_docx_tool_descriptions_warn_about_untrusted_non_rendered_extraction():
         source = (repo_root / relative_path).read_text(encoding="utf-8")
         for phrase in required_phrases:
             assert phrase in source, f"{relative_path} missing {phrase!r} warning"
+
+
+@pytest.mark.asyncio
+@patch("gdrive.drive_tools.resolve_drive_item", new_callable=AsyncMock)
+async def test_get_drive_file_content_docx_uses_extractor_metadata(mock_resolve):
+    from gdrive import drive_tools
+
+    payload = _docx(_body(_p(_r_text("Visible content"))))
+    mock_resolve.return_value = ("synthetic-file", {
+        "mimeType": DOCX_MIME,
+        "name": "Synthetic.docx",
+        "webViewLink": "https://example.invalid/synthetic",
+    })
+    mock_service = Mock()
+    mock_service.files.return_value.get_media.return_value = object()
+
+    with patch.object(
+        drive_tools,
+        "MediaIoBaseDownload",
+        side_effect=lambda fh, request: _FakeDownloader(fh, request, payload),
+    ):
+        result = await _unwrap(drive_tools.get_drive_file_content)(
+            service=mock_service,
+            user_google_email="user@example.com",
+            file_id="synthetic-file",
+        )
+
+    assert "--- EXTRACTION METADATA ---" in result
+    assert "injection_risk: high" in result
+    assert "--- CONTENT ---" in result
+
+
+@pytest.mark.asyncio
+async def test_get_doc_content_docx_uses_extractor_metadata():
+    from gdocs import docs_tools
+
+    payload = _docx(_body(_p(_r_text("Visible content"))))
+    mock_drive_service = Mock()
+    mock_drive_service.files.return_value.get.return_value.execute.return_value = {
+        "id": "synthetic-docx",
+        "name": "Synthetic.docx",
+        "mimeType": DOCX_MIME,
+        "webViewLink": "https://example.invalid/synthetic",
+    }
+    mock_drive_service.files.return_value.get_media.return_value = object()
+    mock_docs_service = Mock()
+
+    with patch.object(
+        docs_tools,
+        "MediaIoBaseDownload",
+        side_effect=lambda fh, request: _FakeDownloader(fh, request, payload),
+    ):
+        result = await _unwrap(docs_tools.get_doc_content)(
+            drive_service=mock_drive_service,
+            docs_service=mock_docs_service,
+            user_google_email="user@example.com",
+            document_id="synthetic-docx",
+        )
+
+    assert "--- EXTRACTION METADATA ---" in result
+    assert "injection_risk: high" in result
+    assert "--- CONTENT ---" in result
