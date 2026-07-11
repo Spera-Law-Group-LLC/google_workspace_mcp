@@ -134,8 +134,8 @@ def test_docx_body_delimiters_are_escaped_and_do_not_create_second_metadata_bloc
 
     result = utils.extract_office_xml_text(data, DOCX_MIME)
 
-    assert result.count("--- EXTRACTION METADATA ---") == 1
-    assert result.count("--- CONTENT ---") == 1
+    assert result.splitlines().count("--- EXTRACTION METADATA ---") == 1
+    assert result.splitlines().count("--- CONTENT ---") == 1
     header = result.split("--- CONTENT ---", 1)[0]
     assert "injection_risk: high" in header
     assert "injection_risk: low" not in header
