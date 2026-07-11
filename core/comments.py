@@ -7,13 +7,31 @@ All Google Workspace apps (Docs, Sheets, Slides) use the Drive API for comment o
 
 import logging
 import asyncio
+import os
 from typing import Optional
+
+from mcp.types import ToolAnnotations
 
 from auth.service_decorator import require_google_service
 from core.server import server
 from core.utils import handle_http_errors
 
 logger = logging.getLogger(__name__)
+
+
+READ_COMMENT_ANNOTATIONS = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+)
+
+MANAGE_COMMENT_ANNOTATIONS = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+)
 
 
 async def _manage_comment_dispatch(
@@ -63,18 +81,25 @@ def create_comment_tools(app_name: str, file_id_param: str):
     # --- Consolidated tools ---
     list_func_name = f"list_{app_name}_comments"
     manage_func_name = f"manage_{app_name}_comment"
+    app_title = app_name.replace("_", " ").title()
 
     if file_id_param == "document_id":
 
         @require_google_service("drive", "drive_read")
-        @handle_http_errors(list_func_name, service_type="drive")
+        @handle_http_errors(list_func_name, is_read_only=True, service_type="drive")
         async def list_comments(
-            service, user_google_email: str, document_id: str
+            service,
+            user_google_email: str,
+            document_id: str,
+            max_comments: int | None = None,
         ) -> str:
-            """List all comments from a Google Document."""
-            return await _read_comments_impl(service, app_name, document_id)
+            """List all comments from a Google Document (optional max_comments to limit results)."""
+            return await _read_comments_impl(
+                service, app_name, document_id, max_comments=max_comments
+            )
 
-        @require_google_service("drive", "drive_file")
+        # Use full Drive scope so comment operations remain visible to collaborators.
+        @require_google_service("drive", "drive")
         @handle_http_errors(manage_func_name, service_type="drive")
         async def manage_comment(
             service,
@@ -87,7 +112,9 @@ def create_comment_tools(app_name: str, file_id_param: str):
             """Manage comments on a Google Document.
 
             Actions:
-              - create: Create a new comment. Requires comment_content.
+              - create: Create a new document-level comment. Requires comment_content.
+                Note: The Drive API cannot anchor comments to specific text; only
+                the Google Docs UI can do that.
               - reply: Reply to a comment. Requires comment_id and comment_content.
               - resolve: Resolve a comment. Requires comment_id.
             """
@@ -98,14 +125,20 @@ def create_comment_tools(app_name: str, file_id_param: str):
     elif file_id_param == "spreadsheet_id":
 
         @require_google_service("drive", "drive_read")
-        @handle_http_errors(list_func_name, service_type="drive")
+        @handle_http_errors(list_func_name, is_read_only=True, service_type="drive")
         async def list_comments(
-            service, user_google_email: str, spreadsheet_id: str
+            service,
+            user_google_email: str,
+            spreadsheet_id: str,
+            max_comments: int | None = None,
         ) -> str:
-            """List all comments from a Google Spreadsheet."""
-            return await _read_comments_impl(service, app_name, spreadsheet_id)
+            """List all comments from a Google Spreadsheet (optional max_comments to limit results)."""
+            return await _read_comments_impl(
+                service, app_name, spreadsheet_id, max_comments=max_comments
+            )
 
-        @require_google_service("drive", "drive_file")
+        # Use full Drive scope so comment operations remain visible to collaborators.
+        @require_google_service("drive", "drive")
         @handle_http_errors(manage_func_name, service_type="drive")
         async def manage_comment(
             service,
@@ -119,6 +152,8 @@ def create_comment_tools(app_name: str, file_id_param: str):
 
             Actions:
               - create: Create a new comment. Requires comment_content.
+                Note: The Drive API cannot anchor comments to arbitrary text;
+                Sheets comments are cell-scoped via the API.
               - reply: Reply to a comment. Requires comment_id and comment_content.
               - resolve: Resolve a comment. Requires comment_id.
             """
@@ -129,14 +164,20 @@ def create_comment_tools(app_name: str, file_id_param: str):
     elif file_id_param == "presentation_id":
 
         @require_google_service("drive", "drive_read")
-        @handle_http_errors(list_func_name, service_type="drive")
+        @handle_http_errors(list_func_name, is_read_only=True, service_type="drive")
         async def list_comments(
-            service, user_google_email: str, presentation_id: str
+            service,
+            user_google_email: str,
+            presentation_id: str,
+            max_comments: int | None = None,
         ) -> str:
-            """List all comments from a Google Presentation."""
-            return await _read_comments_impl(service, app_name, presentation_id)
+            """List all comments from a Google Presentation (optional max_comments to limit results)."""
+            return await _read_comments_impl(
+                service, app_name, presentation_id, max_comments=max_comments
+            )
 
-        @require_google_service("drive", "drive_file")
+        # Use full Drive scope so comment operations remain visible to collaborators.
+        @require_google_service("drive", "drive")
         @handle_http_errors(manage_func_name, service_type="drive")
         async def manage_comment(
             service,
@@ -150,6 +191,8 @@ def create_comment_tools(app_name: str, file_id_param: str):
 
             Actions:
               - create: Create a new comment. Requires comment_content.
+                Note: The Drive API cannot anchor comments to arbitrary text;
+                Slides comments are element-scoped via the API.
               - reply: Reply to a comment. Requires comment_id and comment_content.
               - resolve: Resolve a comment. Requires comment_id.
             """
@@ -159,8 +202,14 @@ def create_comment_tools(app_name: str, file_id_param: str):
 
     list_comments.__name__ = list_func_name
     manage_comment.__name__ = manage_func_name
-    server.tool()(list_comments)
-    server.tool()(manage_comment)
+    server.tool(
+        title=f"List {app_title} Comments",
+        annotations=READ_COMMENT_ANNOTATIONS,
+    )(list_comments)
+    server.tool(
+        title=f"Manage {app_title} Comment",
+        annotations=MANAGE_COMMENT_ANNOTATIONS,
+    )(manage_comment)
 
     return {
         "list_comments": list_comments,
@@ -168,20 +217,47 @@ def create_comment_tools(app_name: str, file_id_param: str):
     }
 
 
-async def _read_comments_impl(service, app_name: str, file_id: str) -> str:
+async def _read_comments_impl(
+    service, app_name: str, file_id: str, max_comments: int | None = None
+) -> str:
     """Implementation for reading comments from any Google Workspace file."""
     logger.info(f"[read_{app_name}_comments] Reading comments for {app_name} {file_id}")
 
-    response = await asyncio.to_thread(
-        service.comments()
-        .list(
-            fileId=file_id,
-            fields="comments(id,content,author,createdTime,modifiedTime,resolved,quotedFileContent,replies(content,author,id,createdTime,modifiedTime))",
-        )
-        .execute
-    )
+    if max_comments is None:
+        try:
+            max_comments = int(os.getenv("WORKSPACE_MCP_COMMENTS_MAX", "100"))
+        except (ValueError, TypeError):
+            max_comments = 100
 
-    comments = response.get("comments", [])
+    if max_comments < 0:
+        max_comments = 100
+    if max_comments == 0:
+        return f"No comments found in {app_name} {file_id}"
+
+    comments: list = []
+    page_token: str | None = None
+
+    while len(comments) < max_comments:
+        remaining = max_comments - len(comments)
+        page_size = min(100, remaining)
+
+        kwargs: dict = {
+            "fileId": file_id,
+            "fields": "nextPageToken,comments(id,content,author,createdTime,modifiedTime,resolved,quotedFileContent,replies(content,author,id,createdTime,modifiedTime))",
+            "pageSize": page_size,
+        }
+        if page_token is not None:
+            kwargs["pageToken"] = page_token
+
+        response = await asyncio.to_thread(service.comments().list(**kwargs).execute)
+
+        page_comments = response.get("comments", [])
+        take = min(len(page_comments), max_comments - len(comments))
+        comments.extend(page_comments[:take])
+
+        page_token = response.get("nextPageToken")
+        if not page_token or len(comments) >= max_comments:
+            break
 
     if not comments:
         return f"No comments found in {app_name} {file_id}"
@@ -205,7 +281,6 @@ async def _read_comments_impl(service, app_name: str, file_id: str) -> str:
             output.append(f"Quoted text: {quoted_text}")
         output.append(f"Content: {content}")
 
-        # Add replies if any
         replies = comment.get("replies", [])
         if replies:
             output.append(f"  Replies ({len(replies)}):")
@@ -227,7 +302,12 @@ async def _read_comments_impl(service, app_name: str, file_id: str) -> str:
 async def _create_comment_impl(
     service, app_name: str, file_id: str, comment_content: str
 ) -> str:
-    """Implementation for creating a comment on any Google Workspace file."""
+    """Implementation for creating a comment on any Google Workspace file.
+
+    Note: Comments created via the Drive API appear as document-level comments.
+    The Google Drive API does not support anchoring comments to specific text in
+    Google Docs; only the Docs UI can create anchored comments.
+    """
     logger.info(f"[create_{app_name}_comment] Creating comment in {app_name} {file_id}")
 
     body = {"content": comment_content}

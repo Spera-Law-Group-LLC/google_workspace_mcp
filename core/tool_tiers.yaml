@@ -28,6 +28,8 @@ drive:
     - create_drive_file
     - create_drive_folder
     - import_to_google_doc
+    - import_to_google_slides
+    - import_to_google_sheets
     - get_drive_shareable_link
   extended:
     - list_drive_items
@@ -45,7 +47,10 @@ calendar:
     - get_events
     - manage_event
   extended:
+    - create_calendar
     - query_freebusy
+    - manage_out_of_office
+    - manage_focus_time
   complete: []
 
 docs:
@@ -61,6 +66,8 @@ docs:
     - insert_doc_elements
     - update_paragraph_style
     - get_doc_as_markdown
+    - list_document_comments
+    - manage_document_comment
   complete:
     - insert_doc_image
     - update_doc_headers_footers
@@ -68,8 +75,7 @@ docs:
     - inspect_doc_structure
     - create_table_with_data
     - debug_table_structure
-    - list_document_comments
-    - manage_document_comment
+    - manage_doc_tab
 
 sheets:
   core:
@@ -80,8 +86,12 @@ sheets:
     - list_spreadsheets
     - get_spreadsheet_info
     - format_sheet_range
+    - list_sheet_tables
   complete:
     - create_sheet
+    - append_table_rows
+    - resize_sheet_dimensions
+    - move_sheet_rows
     - list_spreadsheet_comments
     - manage_spreadsheet_comment
     - manage_conditional_formatting

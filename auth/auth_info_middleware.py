@@ -17,6 +17,13 @@ from auth.oauth_types import WorkspaceAccessToken
 logger = logging.getLogger(__name__)
 
 
+def _token_fingerprint(token: str) -> str:
+    """Return a safe, short fingerprint of a bearer token for logging."""
+    if not token:
+        return "none"
+    return f"{token[:8]}…(len={len(token)})"
+
+
 class AuthInfoMiddleware(Middleware):
     """
     Middleware to extract authentication information from JWT tokens
@@ -70,11 +77,12 @@ class AuthInfoMiddleware(Middleware):
         # Try to get the HTTP request to extract Authorization header
         if not authenticated_user:
             try:
-                # Use the new FastMCP method to get HTTP headers
-                headers = get_http_headers()
+                # Capture the full headers for diagnostics, then scope auth parsing to authorization.
+                all_headers = get_http_headers()
                 logger.info(
-                    f"[AuthInfoMiddleware] get_http_headers() returned: {headers is not None}, keys: {list(headers.keys()) if headers else 'None'}"
+                    f"[AuthInfoMiddleware] get_http_headers() returned: {all_headers is not None}, keys: {list(all_headers.keys()) if all_headers else 'None'}"
                 )
+                headers = get_http_headers(include={"authorization"})
                 if headers:
                     logger.debug("Processing HTTP headers for authentication")
 
@@ -184,11 +192,17 @@ class AuthInfoMiddleware(Middleware):
                                         auth_via = "bearer_token"
                                     else:
                                         logger.error(
-                                            "Failed to verify Google OAuth token"
+                                            f"[AuthInfoMiddleware] Token verification returned None "
+                                            f"reason=verify_token_returned_none "
+                                            f"token={_token_fingerprint(token_str)} "
+                                            f"provider={type(auth_provider).__name__}"
                                         )
                                 except Exception as e:
                                     logger.error(
-                                        f"Error verifying Google OAuth token: {e}"
+                                        f"[AuthInfoMiddleware] Token verification raised exception "
+                                        f"reason=verify_token_exception "
+                                        f"token={_token_fingerprint(token_str)} "
+                                        f"exc_type={type(e).__name__}"
                                     )
                             else:
                                 logger.warning(
@@ -331,6 +345,28 @@ class AuthInfoMiddleware(Middleware):
             )
             logger.debug(
                 f"Context state after auth: authenticated_user_email={auth_email}"
+            )
+        else:
+            try:
+                auth_header = (get_http_headers() or {}).get("authorization", "")
+            except Exception:
+                auth_header = ""
+            if auth_header.startswith("Bearer "):
+                bearer = auth_header[7:]
+                token_fp = _token_fingerprint(bearer)
+                token_kind = (
+                    "google_oauth" if bearer.startswith("ya29.") else "jwt_or_other"
+                )
+            else:
+                token_fp = "none"
+                token_kind = "no_bearer"
+            session_id = getattr(context.fastmcp_context, "session_id", None)
+            logger.warning(
+                f"[AuthInfoMiddleware] No authenticated user resolved "
+                f"reason=all_auth_paths_failed "
+                f"token={token_fp} "
+                f"token_kind={token_kind} "
+                f"session_id={session_id}"
             )
 
     async def on_call_tool(self, context: MiddlewareContext, call_next):

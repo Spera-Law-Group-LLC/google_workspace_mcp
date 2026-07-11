@@ -6,24 +6,39 @@ This module provides MCP tools for interacting with Google Contacts via the Peop
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+import warnings
+from typing import Any, Dict, List, Literal, Optional
 
 from googleapiclient.errors import HttpError
 from mcp import Resource
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+
+from mcp.types import ToolAnnotations
 
 from auth.service_decorator import require_google_service
 from core.server import server
-from core.utils import UserInputError, handle_http_errors
+from core.utils import UserInputError, handle_http_errors, StringList
+from gcontacts.contacts_helpers import (
+    _format_contact,
+    _merge_emails,
+    _merge_nicknames,
+    _merge_organizations,
+    _merge_phones,
+    _merge_relations,
+    _merge_urls,
+    _merge_user_defined,
+    _parse_birthday,
+)
 
 logger = logging.getLogger(__name__)
 
 # Default person fields for list/search operations
-DEFAULT_PERSON_FIELDS = "names,emailAddresses,phoneNumbers,organizations"
+DEFAULT_PERSON_FIELDS = "names,nicknames,emailAddresses,phoneNumbers,organizations"
 
 # Detailed person fields for get operations
 DETAILED_PERSON_FIELDS = (
-    "names,emailAddresses,phoneNumbers,organizations,biographies,"
-    "addresses,birthdays,urls,photos,metadata,memberships"
+    "names,nicknames,emailAddresses,phoneNumbers,organizations,biographies,"
+    "addresses,birthdays,urls,userDefined,relations,photos,metadata,memberships"
 )
 
 # Contact group fields
@@ -32,132 +47,302 @@ CONTACT_GROUP_FIELDS = "name,groupType,memberCount,metadata"
 # Cache warmup tracking
 _search_cache_warmed_up: Dict[str, bool] = {}
 
+# Known phone types supported by Google People API (custom types also allowed)
+KNOWN_PHONE_TYPES = {
+    "home",
+    "work",
+    "mobile",
+    "homeFax",
+    "workFax",
+    "otherFax",
+    "pager",
+    "workMobile",
+    "workPager",
+    "main",
+    "googleVoice",
+    "other",
+    "internal",
+}
 
-def _format_contact(person: Dict[str, Any], detailed: bool = False) -> str:
-    """
-    Format a Person resource into a readable string.
 
-    Args:
-        person: The Person resource from the People API.
-        detailed: Whether to include detailed fields.
+class PhoneInput(BaseModel):
+    """Typed input for a phone entry."""
 
-    Returns:
-        Formatted string representation of the contact.
-    """
-    resource_name = person.get("resourceName", "Unknown")
-    contact_id = resource_name.replace("people/", "") if resource_name else "Unknown"
+    model_config = ConfigDict(extra="forbid")
 
-    lines = [f"Contact ID: {contact_id}"]
+    number: Optional[str] = Field(
+        default=None,
+        description="Phone number value.",
+    )
+    value: Optional[str] = Field(
+        default=None,
+        description="Backward-compatible alias for the phone number value.",
+    )
+    type: Optional[str] = Field(
+        default=None,
+        description="Phone type such as mobile, work, home, or internal.",
+    )
 
-    # Names
-    names = person.get("names", [])
-    if names:
-        primary_name = names[0]
-        display_name = primary_name.get("displayName", "")
-        if display_name:
-            lines.append(f"Name: {display_name}")
 
-    # Email addresses
-    emails = person.get("emailAddresses", [])
-    if emails:
-        email_list = [e.get("value", "") for e in emails if e.get("value")]
-        if email_list:
-            lines.append(f"Email: {', '.join(email_list)}")
+class EmailInput(BaseModel):
+    """Typed input for an email entry."""
 
-    # Phone numbers
-    phones = person.get("phoneNumbers", [])
-    if phones:
-        phone_list = [p.get("value", "") for p in phones if p.get("value")]
-        if phone_list:
-            lines.append(f"Phone: {', '.join(phone_list)}")
+    model_config = ConfigDict(extra="forbid")
 
-    # Organizations
-    orgs = person.get("organizations", [])
-    if orgs:
-        org = orgs[0]
-        org_parts = []
-        if org.get("title"):
-            org_parts.append(org["title"])
-        if org.get("name"):
-            org_parts.append(f"at {org['name']}")
-        if org_parts:
-            lines.append(f"Organization: {' '.join(org_parts)}")
+    address: Optional[str] = Field(
+        default=None,
+        description="Email address value.",
+    )
+    value: Optional[str] = Field(
+        default=None,
+        description="Backward-compatible alias for the email address value.",
+    )
+    type: Optional[str] = Field(
+        default=None,
+        description="Email type such as work, home, or other.",
+    )
 
-    if detailed:
-        # Addresses
-        addresses = person.get("addresses", [])
-        if addresses:
-            addr = addresses[0]
-            formatted_addr = addr.get("formattedValue", "")
-            if formatted_addr:
-                lines.append(f"Address: {formatted_addr}")
 
-        # Birthday
-        birthdays = person.get("birthdays", [])
-        if birthdays:
-            bday = birthdays[0].get("date", {})
-            if bday:
-                bday_str = f"{bday.get('month', '?')}/{bday.get('day', '?')}"
-                if bday.get("year"):
-                    bday_str = f"{bday.get('year')}/{bday_str}"
-                lines.append(f"Birthday: {bday_str}")
+class OrganizationInput(BaseModel):
+    """Typed input for an organization entry."""
 
-        # URLs
-        urls = person.get("urls", [])
-        if urls:
-            url_list = [u.get("value", "") for u in urls if u.get("value")]
-            if url_list:
-                lines.append(f"URLs: {', '.join(url_list)}")
+    model_config = ConfigDict(extra="forbid")
 
-        # Biography/Notes
-        bios = person.get("biographies", [])
-        if bios:
-            bio = bios[0].get("value", "")
-            if bio:
-                # Truncate long bios
-                if len(bio) > 200:
-                    bio = bio[:200] + "..."
-                lines.append(f"Notes: {bio}")
+    name: Optional[str] = Field(default=None, description="Organization name.")
+    title: Optional[str] = Field(default=None, description="Job title.")
+    department: Optional[str] = Field(default=None, description="Department name.")
+    jobDescription: Optional[str] = Field(
+        default=None,
+        description="Optional organization job description.",
+        validation_alias=AliasChoices("jobDescription", "description"),
+    )
+    type: Optional[str] = Field(
+        default=None,
+        description="Organization type such as work or school.",
+    )
 
-        # Metadata
-        metadata = person.get("metadata", {})
-        if metadata:
-            sources = metadata.get("sources", [])
-            if sources:
-                source_types = [s.get("type", "") for s in sources]
-                if source_types:
-                    lines.append(f"Sources: {', '.join(source_types)}")
 
-    return "\n".join(lines)
+class NicknameInput(BaseModel):
+    """Typed input for a nickname entry."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    value: str = Field(
+        description="Nickname value. Used for bilingual contacts (e.g. Hebrew alternative form).",
+    )
+    type: Optional[str] = Field(
+        default=None,
+        description="Nickname type such as default, alternate_name, maiden_name, initials, or other.",
+    )
+
+
+class UrlInput(BaseModel):
+    """Typed input for a URL entry."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    value: str = Field(
+        description="The URL value (e.g. https://example.com).",
+    )
+    type: Optional[str] = Field(
+        default=None,
+        description="URL type such as homepage, blog, profile, work, ftp, reservations, or other. Custom values allowed.",
+    )
+
+
+class UserDefinedInput(BaseModel):
+    """Typed input for a userDefined custom field entry."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(
+        description="Custom field key (e.g. 'ID', 'Hebrew Birthday', 'Account Number').",
+    )
+    value: str = Field(
+        default="",
+        description="Custom field value. May be omitted when using remove mode (only the key is needed).",
+    )
+
+
+class RelationInput(BaseModel):
+    """Typed input for a relation entry (spouse, parent, child, etc.)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    person: str = Field(
+        description="The related person's name (matched against contact names by Google Assistant).",
+    )
+    type: Optional[str] = Field(
+        default=None,
+        description="Relation type: spouse, child, parent, father, mother, sister, brother, friend, manager, assistant, partner, sibling, domesticPartner, or custom.",
+    )
+
+
+class ContactInput(BaseModel):
+    """Typed batch-create input for a contact."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    given_name: Optional[str] = None
+    family_name: Optional[str] = None
+    phones: Optional[List[PhoneInput]] = None
+    emails: Optional[List[EmailInput]] = None
+    organizations: Optional[List[OrganizationInput]] = None
+    nicknames: Optional[List[NicknameInput]] = None
+    urls: Optional[List[UrlInput]] = None
+    user_defined: Optional[List[UserDefinedInput]] = None
+    relations: Optional[List[RelationInput]] = None
+    notes: Optional[str] = None
+    address: Optional[str] = None
+    birthday: Optional[str] = Field(
+        default=None,
+        description="Birthday as 'YYYY-MM-DD', 'MM-DD' (no year), or 'clear'/'' to remove.",
+    )
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    organization: Optional[str] = None
+    job_title: Optional[str] = None
+
+
+class ContactUpdateInput(ContactInput):
+    """Typed batch-update input for a contact."""
+
+    contact_id: str = Field(
+        description='Contact ID like "c123" or full resource name like "people/c123".'
+    )
+
+
+def _coerce_phone_input(phone: Any) -> PhoneInput:
+    if isinstance(phone, PhoneInput):
+        return phone
+    if isinstance(phone, dict):
+        phone = dict(phone)
+        if not phone.get("type") and phone.get("label"):
+            phone["type"] = phone["label"]
+        phone.pop("label", None)
+    return PhoneInput.model_validate(phone)
+
+
+def _coerce_email_input(email: Any) -> EmailInput:
+    if isinstance(email, EmailInput):
+        return email
+    if isinstance(email, dict):
+        email = dict(email)
+        if not email.get("type") and email.get("label"):
+            email["type"] = email["label"]
+        email.pop("label", None)
+    return EmailInput.model_validate(email)
+
+
+def _coerce_organization_input(org: Any) -> OrganizationInput:
+    if isinstance(org, OrganizationInput):
+        return org
+    return OrganizationInput.model_validate(org)
+
+
+def _coerce_nickname_input(nickname: Any) -> NicknameInput:
+    if isinstance(nickname, NicknameInput):
+        return nickname
+    if isinstance(nickname, str):
+        return NicknameInput(value=nickname)
+    return NicknameInput.model_validate(nickname)
+
+
+def _coerce_url_input(url: Any) -> UrlInput:
+    if isinstance(url, UrlInput):
+        return url
+    if isinstance(url, str):
+        return UrlInput(value=url)
+    return UrlInput.model_validate(url)
+
+
+def _coerce_user_defined_input(entry: Any) -> UserDefinedInput:
+    if isinstance(entry, UserDefinedInput):
+        return entry
+    return UserDefinedInput.model_validate(entry)
+
+
+def _coerce_relation_input(relation: Any) -> RelationInput:
+    if isinstance(relation, RelationInput):
+        return relation
+    if isinstance(relation, str):
+        return RelationInput(person=relation)
+    return RelationInput.model_validate(relation)
+
+
+def _coerce_contact_input(contact: Any) -> ContactInput:
+    if isinstance(contact, ContactInput):
+        return contact
+    return ContactInput.model_validate(contact)
+
+
+def _coerce_contact_update_input(update: Any) -> ContactUpdateInput:
+    if isinstance(update, ContactUpdateInput):
+        return update
+    return ContactUpdateInput.model_validate(update)
 
 
 def _build_person_body(
     given_name: Optional[str] = None,
     family_name: Optional[str] = None,
+    # New multi-value params
+    phones: Optional[List[PhoneInput]] = None,
+    emails: Optional[List[EmailInput]] = None,
+    organizations: Optional[List[OrganizationInput]] = None,
+    nicknames: Optional[List[NicknameInput]] = None,
+    urls: Optional[List[UrlInput]] = None,
+    user_defined: Optional[List[UserDefinedInput]] = None,
+    relations: Optional[List[RelationInput]] = None,
+    notes: Optional[str] = None,
+    address: Optional[str] = None,
+    birthday: Optional[str] = None,
+    # Deprecated single-value aliases
     email: Optional[str] = None,
     phone: Optional[str] = None,
     organization: Optional[str] = None,
     job_title: Optional[str] = None,
-    notes: Optional[str] = None,
-    address: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Build a Person resource body for create/update operations.
 
+    Accepts both new list-based params (phones, emails, organizations) and
+    deprecated single-value aliases (phone, email, organization, job_title).
+
     Args:
         given_name: First name.
         family_name: Last name.
-        email: Email address.
-        phone: Phone number.
-        organization: Company/organization name.
-        job_title: Job title.
+        phones: List of PhoneInput items {number, value?, type?}.
+            Supported types: mobile, work, home, main, workMobile, internal, other, etc.
+            Use type="internal" for PBX/ATS short numbers (e.g. 250, 301).
+        emails: List of EmailInput items {address, value?, type?}.
+        organizations: List of OrganizationInput items {name?, title?, department?, jobDescription?, type?}.
         notes: Additional notes/biography.
         address: Street address.
+        birthday: Birthday as 'YYYY-MM-DD', 'MM-DD' (no year), or 'clear'/'' to remove.
+        email: [DEPRECATED] Single email address. Use emails instead.
+        phone: [DEPRECATED] Single phone number. Use phones instead.
+        organization: [DEPRECATED] Company/organization name. Use organizations instead.
+        job_title: [DEPRECATED] Job title. Use organizations instead.
 
     Returns:
         Person resource body dictionary.
     """
     body: Dict[str, Any] = {}
+
+    if phones is not None:
+        phones = [_coerce_phone_input(phone) for phone in phones]
+    if emails is not None:
+        emails = [_coerce_email_input(email_entry) for email_entry in emails]
+    if organizations is not None:
+        organizations = [_coerce_organization_input(org) for org in organizations]
+    if nicknames is not None:
+        nicknames = [_coerce_nickname_input(n) for n in nicknames]
+    if urls is not None:
+        urls = [_coerce_url_input(u) for u in urls]
+    if user_defined is not None:
+        user_defined = [_coerce_user_defined_input(ud) for ud in user_defined]
+    if relations is not None:
+        relations = [_coerce_relation_input(r) for r in relations]
 
     if given_name or family_name:
         body["names"] = [
@@ -167,25 +352,176 @@ def _build_person_body(
             }
         ]
 
-    if email:
-        body["emailAddresses"] = [{"value": email}]
+    # --- Emails ---
+    if emails is not None and email is not None:
+        warnings.warn(
+            "Parameter 'email' ignored because 'emails' was provided",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+    if emails is None and email is not None:
+        warnings.warn(
+            "Parameter 'email' is deprecated. Use 'emails=[{\"address\": ..., \"type\": ...}]' instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        emails = [EmailInput(address=email, type="other")]
 
-    if phone:
-        body["phoneNumbers"] = [{"value": phone}]
+    if emails is not None:
+        email_entries = []
+        for e in emails:
+            entry: Dict[str, Any] = {"value": e.address or e.value or ""}
+            if e.type:
+                entry["type"] = e.type
+            if entry["value"]:
+                email_entries.append(entry)
+        body["emailAddresses"] = email_entries
 
-    if organization or job_title:
-        org_entry: Dict[str, str] = {}
-        if organization:
-            org_entry["name"] = organization
-        if job_title:
-            org_entry["title"] = job_title
-        body["organizations"] = [org_entry]
+    # --- Phones ---
+    if phones is not None and phone is not None:
+        warnings.warn(
+            "Parameter 'phone' ignored because 'phones' was provided",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+    if phones is None and phone is not None:
+        warnings.warn(
+            "Parameter 'phone' is deprecated. Use 'phones=[{\"number\": ..., \"type\": ...}]' instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        phones = [PhoneInput(number=phone, type="mobile")]
 
-    if notes:
-        body["biographies"] = [{"value": notes, "contentType": "TEXT_PLAIN"}]
+    if phones is not None:
+        phone_entries = []
+        for p in phones:
+            number = p.number or p.value or ""
+            if not number:
+                continue
+            entry = {"value": number}
+            if p.type:
+                entry["type"] = p.type
+            phone_entries.append(entry)
+        body["phoneNumbers"] = phone_entries
+
+    # --- Organizations ---
+    if organizations is not None and (
+        organization is not None or job_title is not None
+    ):
+        ignored_params = []
+        if organization is not None:
+            ignored_params.append("'organization'")
+        if job_title is not None:
+            ignored_params.append("'job_title'")
+        ignored = " and ".join(ignored_params)
+        parameter_label = "Parameter" if len(ignored_params) == 1 else "Parameters"
+        warnings.warn(
+            f"{parameter_label} {ignored} ignored because 'organizations' was provided",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+    if organizations is None and (organization is not None or job_title is not None):
+        if organization is not None:
+            warnings.warn(
+                "Parameter 'organization' is deprecated. Use 'organizations=[{\"name\": ..., \"type\": ...}]' instead.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+        if job_title is not None:
+            warnings.warn(
+                "Parameter 'job_title' is deprecated. Use 'organizations=[{\"title\": ...}]' instead.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+        organizations = [OrganizationInput(name=organization, title=job_title)]
+
+    if organizations is not None:
+        org_entries = []
+        for org in organizations:
+            entry = {}
+            if org.name:
+                entry["name"] = org.name
+            if org.title:
+                entry["title"] = org.title
+            if org.department:
+                entry["department"] = org.department
+            if org.jobDescription:
+                entry["jobDescription"] = org.jobDescription
+            if org.type:
+                entry["type"] = org.type
+            if entry:
+                org_entries.append(entry)
+        body["organizations"] = org_entries
+
+    # --- Nicknames ---
+    if nicknames is not None:
+        nickname_entries = []
+        for n in nicknames:
+            value = (n.value or "").strip()
+            if not value:
+                continue
+            entry: Dict[str, Any] = {"value": value}
+            if n.type:
+                entry["type"] = n.type
+            nickname_entries.append(entry)
+        body["nicknames"] = nickname_entries
+
+    # --- URLs ---
+    if urls is not None:
+        url_entries = []
+        for u in urls:
+            value = (u.value or "").strip()
+            if not value:
+                continue
+            entry = {"value": value}
+            if u.type:
+                entry["type"] = u.type
+            url_entries.append(entry)
+        body["urls"] = url_entries
+
+    # --- User Defined custom fields ---
+    if user_defined is not None:
+        ud_entries = []
+        for ud in user_defined:
+            key = (ud.key or "").strip()
+            value = (ud.value or "").strip()
+            if not key:
+                continue
+            entry: Dict[str, str] = {"key": key}
+            if value:
+                entry["value"] = value
+            ud_entries.append(entry)
+        body["userDefined"] = ud_entries
+
+    # --- Relations ---
+    if relations is not None:
+        relation_entries = []
+        for r in relations:
+            person = (r.person or "").strip()
+            if not person:
+                continue
+            entry = {"person": person}
+            if r.type:
+                entry["type"] = r.type
+            relation_entries.append(entry)
+        body["relations"] = relation_entries
+
+    # notes=None → no change. notes="" → explicit clear (empty biographies).
+    # notes="text" → write that text.
+    if notes is not None:
+        if notes:
+            body["biographies"] = [{"value": notes, "contentType": "TEXT_PLAIN"}]
+        else:
+            body["biographies"] = []
 
     if address:
         body["addresses"] = [{"formattedValue": address}]
+
+    if birthday is not None:
+        if birthday.strip().lower() in ("clear", ""):
+            body["birthdays"] = []
+        else:
+            body["birthdays"] = [_parse_birthday(birthday)]
 
     return body
 
@@ -225,7 +561,15 @@ async def _warmup_search_cache(service: Resource, user_google_email: str) -> Non
 # =============================================================================
 
 
-@server.tool()
+@server.tool(
+    title="List Contacts",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @require_google_service("people", "contacts_read")
 @handle_http_errors("list_contacts", service_type="people")
 async def list_contacts(
@@ -289,7 +633,15 @@ async def list_contacts(
     return response
 
 
-@server.tool()
+@server.tool(
+    title="Get Contact",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @require_google_service("people", "contacts_read")
 @handle_http_errors("get_contact", service_type="people")
 async def get_contact(
@@ -330,7 +682,15 @@ async def get_contact(
     return response
 
 
-@server.tool()
+@server.tool(
+    title="Search Contacts",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @require_google_service("people", "contacts_read")
 @handle_http_errors("search_contacts", service_type="people")
 async def search_contacts(
@@ -388,21 +748,48 @@ async def search_contacts(
     return response
 
 
-@server.tool()
+@server.tool(
+    title="Manage Contact",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
 @require_google_service("people", "contacts")
 @handle_http_errors("manage_contact", service_type="people")
 async def manage_contact(
     service: Resource,
     user_google_email: str,
-    action: str,
+    action: Literal["create", "update", "delete"],
     contact_id: Optional[str] = None,
     given_name: Optional[str] = None,
     family_name: Optional[str] = None,
-    email: Optional[str] = None,
+    # New multi-value params
+    phones: Optional[List[PhoneInput]] = None,
+    emails: Optional[List[EmailInput]] = None,
+    organizations: Optional[List[OrganizationInput]] = None,
+    nicknames: Optional[List[NicknameInput]] = None,
+    urls: Optional[List[UrlInput]] = None,
+    user_defined: Optional[List[UserDefinedInput]] = None,
+    relations: Optional[List[RelationInput]] = None,
+    notes: Optional[str] = None,
+    address: Optional[str] = None,
+    birthday: Optional[str] = None,
+    # Merge modes for update action
+    phones_mode: Literal["merge", "replace", "remove"] = "merge",
+    emails_mode: Literal["merge", "replace", "remove"] = "merge",
+    organizations_mode: Literal["merge", "replace", "remove"] = "merge",
+    nicknames_mode: Literal["merge", "replace", "remove"] = "merge",
+    urls_mode: Literal["merge", "replace", "remove"] = "merge",
+    user_defined_mode: Literal["merge", "replace", "remove"] = "merge",
+    relations_mode: Literal["merge", "replace", "remove"] = "merge",
+    # Deprecated single-value aliases
     phone: Optional[str] = None,
+    email: Optional[str] = None,
     organization: Optional[str] = None,
     job_title: Optional[str] = None,
-    notes: Optional[str] = None,
 ) -> str:
     """
     Create, update, or delete a contact. Consolidated tool replacing create_contact,
@@ -414,11 +801,41 @@ async def manage_contact(
         contact_id (Optional[str]): The contact ID. Required for "update" and "delete" actions.
         given_name (Optional[str]): First name (for create/update).
         family_name (Optional[str]): Last name (for create/update).
-        email (Optional[str]): Email address (for create/update).
-        phone (Optional[str]): Phone number (for create/update).
-        organization (Optional[str]): Company/organization name (for create/update).
-        job_title (Optional[str]): Job title (for create/update).
+        phones (Optional[List[Dict]]): List of phone dicts {number, type?}.
+            Supported types: mobile, work, home, main, workMobile, internal, other, etc.
+            Use type="internal" for internal PBX/ATS short numbers (e.g. 250, 301) — stored
+            as a standalone number without + prefix, displayed as "Internal: 250".
+        emails (Optional[List[Dict]]): List of email dicts {address, type?}.
+        organizations (Optional[List[Dict]]): List of org dicts {name?, title?, department?, jobDescription?, type?}.
+        nicknames (Optional[List[Dict]]): List of nickname dicts {value, type?}.
+            Useful for bilingual contacts (e.g. Hebrew/English alternative forms). Android dialer
+            and WhatsApp search both index nicknames, enabling cross-script lookup.
+            Supported types: default, alternate_name, maiden_name, initials, other, etc.
+        urls (Optional[List[Dict]]): List of URL dicts {value, type?}.
+            Supported types: homepage, blog, profile, work, ftp, reservations, other, etc.
+        user_defined (Optional[List[Dict]]): List of custom field dicts {key, value}.
+            Useful for structured data like account numbers, IDs, or custom dates.
+        relations (Optional[List[Dict]]): List of relation dicts {person, type?}.
+            Supported types: spouse, child, parent, friend, manager, assistant, etc.
         notes (Optional[str]): Additional notes (for create/update).
+        address (Optional[str]): Street address (for create/update).
+        birthday (Optional[str]): Birthday as 'YYYY-MM-DD', 'MM-DD' (no year), or 'clear'/'' to remove.
+        phones_mode (str): How to update phones on "update": "merge" (default), "replace", or "remove".
+            merge = read-modify-write with dedup by canonicalForm/normalized value.
+            replace = overwrite all phones with provided list.
+            remove = delete phones matching provided numbers.
+        emails_mode (str): How to update emails on "update": "merge" (default), "replace", or "remove".
+        organizations_mode (str): How to update orgs on "update": "merge" (default), "replace", or "remove".
+        nicknames_mode (str): How to update nicknames on "update": "merge" (default), "replace", or "remove".
+        urls_mode (str): How to update urls on "update": "merge" (default), "replace", or "remove".
+            merge dedups by normalized URL (lowercased, trailing slash stripped).
+        user_defined_mode (str): How to update custom fields on "update": "merge" (default), "replace", or "remove".
+            merge overrides value on matching key; new keys appended.
+        relations_mode (str): How to update relations on "update": "merge" (default), "replace", or "remove".
+        phone (Optional[str]): [DEPRECATED] Single phone number. Use phones=[{"number":..., "type":"mobile"}].
+        email (Optional[str]): [DEPRECATED] Email address. Use emails=[{"address":..., "type":"other"}].
+        organization (Optional[str]): [DEPRECATED] Company name. Use organizations=[{"name":...}].
+        job_title (Optional[str]): [DEPRECATED] Job title. Use organizations=[{"title":...}].
 
     Returns:
         str: Result of the action performed.
@@ -429,6 +846,20 @@ async def manage_contact(
             f"Invalid action '{action}'. Must be 'create', 'update', or 'delete'."
         )
 
+    for mode_name, mode_val in [
+        ("phones_mode", phones_mode),
+        ("emails_mode", emails_mode),
+        ("organizations_mode", organizations_mode),
+        ("nicknames_mode", nicknames_mode),
+        ("urls_mode", urls_mode),
+        ("user_defined_mode", user_defined_mode),
+        ("relations_mode", relations_mode),
+    ]:
+        if mode_val not in ("merge", "replace", "remove"):
+            raise UserInputError(
+                f"Invalid {mode_name} '{mode_val}'. Must be 'merge', 'replace', or 'remove'."
+            )
+
     logger.info(
         f"[manage_contact] Invoked. Action: '{action}', Email: '{user_google_email}'"
     )
@@ -437,11 +868,20 @@ async def manage_contact(
         body = _build_person_body(
             given_name=given_name,
             family_name=family_name,
-            email=email,
+            phones=phones,
+            emails=emails,
+            organizations=organizations,
+            nicknames=nicknames,
+            urls=urls,
+            user_defined=user_defined,
+            relations=relations,
+            notes=notes,
+            address=address,
+            birthday=birthday,
             phone=phone,
+            email=email,
             organization=organization,
             job_title=job_title,
-            notes=notes,
         )
 
         if not body:
@@ -473,64 +913,148 @@ async def manage_contact(
         resource_name = contact_id
 
     if action == "update":
-        # Fetch the contact to get the etag
-        current = await asyncio.to_thread(
-            service.people()
-            .get(resourceName=resource_name, personFields=DETAILED_PERSON_FIELDS)
-            .execute
-        )
-
-        etag = current.get("etag")
-        if not etag:
-            raise Exception("Unable to get contact etag for update.")
-
-        body = _build_person_body(
-            given_name=given_name,
-            family_name=family_name,
-            email=email,
-            phone=phone,
-            organization=organization,
-            job_title=job_title,
-            notes=notes,
-        )
-
-        if not body:
-            raise UserInputError(
-                "At least one field (name, email, phone, etc.) must be provided."
+        # Retry loop for etag conflicts (412 Precondition Failed)
+        max_retries = 3
+        for attempt in range(max_retries):
+            # Fetch the contact to get current state and etag
+            current = await asyncio.to_thread(
+                service.people()
+                .get(resourceName=resource_name, personFields=DETAILED_PERSON_FIELDS)
+                .execute
             )
 
-        body["etag"] = etag
+            etag = current.get("etag")
+            if not etag:
+                raise Exception("Unable to get contact etag for update.")
 
-        update_person_fields = []
-        if "names" in body:
-            update_person_fields.append("names")
-        if "emailAddresses" in body:
-            update_person_fields.append("emailAddresses")
-        if "phoneNumbers" in body:
-            update_person_fields.append("phoneNumbers")
-        if "organizations" in body:
-            update_person_fields.append("organizations")
-        if "biographies" in body:
-            update_person_fields.append("biographies")
-        if "addresses" in body:
-            update_person_fields.append("addresses")
-
-        result = await asyncio.to_thread(
-            service.people()
-            .updateContact(
-                resourceName=resource_name,
-                body=body,
-                updatePersonFields=",".join(update_person_fields),
-                personFields=DETAILED_PERSON_FIELDS,
+            # Build body from provided params (returns new values only)
+            new_body = _build_person_body(
+                given_name=given_name,
+                family_name=family_name,
+                phones=phones,
+                emails=emails,
+                organizations=organizations,
+                nicknames=nicknames,
+                urls=urls,
+                user_defined=user_defined,
+                relations=relations,
+                notes=notes,
+                address=address,
+                birthday=birthday,
+                phone=phone,
+                email=email,
+                organization=organization,
+                job_title=job_title,
             )
-            .execute
-        )
 
-        response = f"Contact Updated for {user_google_email}:\n\n"
-        response += _format_contact(result, detailed=True)
+            if not new_body:
+                raise UserInputError(
+                    "At least one field (name, email, phone, etc.) must be provided."
+                )
 
-        logger.info(f"Updated contact {resource_name} for {user_google_email}")
-        return response
+            # Apply merge modes for array fields
+            merged_body: Dict[str, Any] = dict(new_body)
+
+            if "phoneNumbers" in new_body:
+                merged_body["phoneNumbers"] = _merge_phones(
+                    current.get("phoneNumbers", []),
+                    new_body["phoneNumbers"],
+                    phones_mode,
+                )
+
+            if "emailAddresses" in new_body:
+                merged_body["emailAddresses"] = _merge_emails(
+                    current.get("emailAddresses", []),
+                    new_body["emailAddresses"],
+                    emails_mode,
+                )
+
+            if "organizations" in new_body:
+                merged_body["organizations"] = _merge_organizations(
+                    current.get("organizations", []),
+                    new_body["organizations"],
+                    organizations_mode,
+                )
+
+            if "nicknames" in new_body:
+                merged_body["nicknames"] = _merge_nicknames(
+                    current.get("nicknames", []),
+                    new_body["nicknames"],
+                    nicknames_mode,
+                )
+
+            if "urls" in new_body:
+                merged_body["urls"] = _merge_urls(
+                    current.get("urls", []),
+                    new_body["urls"],
+                    urls_mode,
+                )
+
+            if "userDefined" in new_body:
+                merged_body["userDefined"] = _merge_user_defined(
+                    current.get("userDefined", []),
+                    new_body["userDefined"],
+                    user_defined_mode,
+                )
+
+            if "relations" in new_body:
+                merged_body["relations"] = _merge_relations(
+                    current.get("relations", []),
+                    new_body["relations"],
+                    relations_mode,
+                )
+
+            merged_body["etag"] = etag
+
+            update_person_fields = []
+            if "names" in merged_body:
+                update_person_fields.append("names")
+            if "emailAddresses" in merged_body:
+                update_person_fields.append("emailAddresses")
+            if "phoneNumbers" in merged_body:
+                update_person_fields.append("phoneNumbers")
+            if "organizations" in merged_body:
+                update_person_fields.append("organizations")
+            if "nicknames" in merged_body:
+                update_person_fields.append("nicknames")
+            if "urls" in merged_body:
+                update_person_fields.append("urls")
+            if "userDefined" in merged_body:
+                update_person_fields.append("userDefined")
+            if "relations" in merged_body:
+                update_person_fields.append("relations")
+            if "biographies" in merged_body:
+                update_person_fields.append("biographies")
+            if "addresses" in merged_body:
+                update_person_fields.append("addresses")
+            if "birthdays" in merged_body:
+                update_person_fields.append("birthdays")
+
+            try:
+                result = await asyncio.to_thread(
+                    service.people()
+                    .updateContact(
+                        resourceName=resource_name,
+                        body=merged_body,
+                        updatePersonFields=",".join(update_person_fields),
+                        personFields=DETAILED_PERSON_FIELDS,
+                    )
+                    .execute
+                )
+
+                response = f"Contact Updated for {user_google_email}:\n\n"
+                response += _format_contact(result, detailed=True)
+
+                logger.info(f"Updated contact {resource_name} for {user_google_email}")
+                return response
+
+            except HttpError as e:
+                if e.resp.status == 412 and attempt < max_retries - 1:
+                    logger.warning(
+                        f"[manage_contact] etag conflict on attempt {attempt + 1}, retrying..."
+                    )
+                    continue
+                raise
 
     # action == "delete"
     await asyncio.to_thread(
@@ -547,7 +1071,15 @@ async def manage_contact(
 # =============================================================================
 
 
-@server.tool()
+@server.tool(
+    title="List Contact Groups",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @require_google_service("people", "contacts_read")
 @handle_http_errors("list_contact_groups", service_type="people")
 async def list_contact_groups(
@@ -610,7 +1142,15 @@ async def list_contact_groups(
     return response
 
 
-@server.tool()
+@server.tool(
+    title="Get Contact Group",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @require_google_service("people", "contacts_read")
 @handle_http_errors("get_contact_group", service_type="people")
 async def get_contact_group(
@@ -680,16 +1220,39 @@ async def get_contact_group(
 # =============================================================================
 
 
-@server.tool()
+@server.tool(
+    title="Manage Contacts Batch",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
 @require_google_service("people", "contacts")
 @handle_http_errors("manage_contacts_batch", service_type="people")
 async def manage_contacts_batch(
     service: Resource,
     user_google_email: str,
-    action: str,
-    contacts: Optional[List[Dict[str, str]]] = None,
-    updates: Optional[List[Dict[str, str]]] = None,
-    contact_ids: Optional[List[str]] = None,
+    action: Literal["create", "update", "delete"],
+    contacts: Optional[List[ContactInput]] = None,
+    updates: Optional[List[ContactUpdateInput]] = None,
+    contact_ids: Optional[StringList] = None,
+    field: Optional[
+        Literal[
+            "names",
+            "phoneNumbers",
+            "emailAddresses",
+            "organizations",
+            "nicknames",
+            "urls",
+            "userDefined",
+            "relations",
+            "biographies",
+            "addresses",
+            "birthdays",
+        ]
+    ] = None,
 ) -> str:
     """
     Batch create, update, or delete contacts. Consolidated tool replacing
@@ -698,12 +1261,17 @@ async def manage_contacts_batch(
     Args:
         user_google_email (str): The user's Google email address. Required.
         action (str): The action to perform: "create", "update", or "delete".
-        contacts (Optional[List[Dict[str, str]]]): List of contact dicts for "create" action.
-            Each dict may contain: given_name, family_name, email, phone, organization, job_title.
-        updates (Optional[List[Dict[str, str]]]): List of update dicts for "update" action.
-            Each dict must contain contact_id and may contain: given_name, family_name,
-            email, phone, organization, job_title.
+        contacts (Optional[List[Dict]]): List of contact dicts for "create" action.
+            Each dict may contain: given_name, family_name, phones, emails, organizations,
+            notes, address. Deprecated: phone, email, organization, job_title.
+        updates (Optional[List[Dict]]): List of update dicts for "update" action.
+            Each dict must contain contact_id and may contain the same fields as contacts.
         contact_ids (Optional[List[str]]): List of contact IDs for "delete" action.
+        field (str): For "update" action — the single People API field to update across
+            all contacts in this batch. Required. Must be one of: names, phoneNumbers,
+            emailAddresses, organizations, nicknames, urls, userDefined, relations,
+            biographies, addresses, birthdays. Using a single field per batch call prevents
+            unintentional data loss from a union updateMask overwriting unrelated fields.
 
     Returns:
         str: Result of the batch action performed.
@@ -718,6 +1286,11 @@ async def manage_contacts_batch(
         f"[manage_contacts_batch] Invoked. Action: '{action}', Email: '{user_google_email}'"
     )
 
+    if contacts is not None:
+        contacts = [_coerce_contact_input(contact) for contact in contacts]
+    if updates is not None:
+        updates = [_coerce_contact_update_input(update) for update in updates]
+
     if action == "create":
         if not contacts:
             raise UserInputError("contacts parameter is required for 'create' action.")
@@ -728,12 +1301,23 @@ async def manage_contacts_batch(
         contact_bodies = []
         for contact in contacts:
             body = _build_person_body(
-                given_name=contact.get("given_name"),
-                family_name=contact.get("family_name"),
-                email=contact.get("email"),
-                phone=contact.get("phone"),
-                organization=contact.get("organization"),
-                job_title=contact.get("job_title"),
+                given_name=contact.given_name,
+                family_name=contact.family_name,
+                phones=contact.phones,
+                emails=contact.emails,
+                organizations=contact.organizations,
+                nicknames=contact.nicknames,
+                urls=contact.urls,
+                user_defined=contact.user_defined,
+                relations=contact.relations,
+                notes=contact.notes,
+                address=contact.address,
+                birthday=contact.birthday,
+                # deprecated aliases
+                phone=contact.phone,
+                email=contact.email,
+                organization=contact.organization,
+                job_title=contact.job_title,
             )
             if body:
                 contact_bodies.append({"contactPerson": body})
@@ -771,10 +1355,37 @@ async def manage_contacts_batch(
         if len(updates) > 200:
             raise UserInputError("Maximum 200 contacts can be updated in a batch.")
 
-        # Fetch all contacts to get their etags
+        # Validate field param — required to avoid multi-field mask issues
+        valid_fields = {
+            "names",
+            "phoneNumbers",
+            "emailAddresses",
+            "organizations",
+            "nicknames",
+            "urls",
+            "userDefined",
+            "relations",
+            "biographies",
+            "addresses",
+            "birthdays",
+        }
+        if not field:
+            raise UserInputError(
+                "field parameter is required for batch 'update' action. "
+                "Must be one of: names, phoneNumbers, emailAddresses, organizations, "
+                "nicknames, urls, userDefined, relations, biographies, addresses, birthdays. "
+                "Use a single field per batch call to avoid unintentional data loss "
+                "from a union updateMask."
+            )
+        if field not in valid_fields:
+            raise UserInputError(
+                f"Invalid field '{field}'. Must be one of: {', '.join(sorted(valid_fields))}."
+            )
+
+        # Collect resource names for batch etag fetch
         resource_names = []
         for update in updates:
-            cid = update.get("contact_id")
+            cid = update.contact_id
             if not cid:
                 raise UserInputError("Each update must include a contact_id.")
             if not cid.startswith("people/"):
@@ -798,11 +1409,27 @@ async def manage_contacts_batch(
             if rname and etag:
                 etags[rname] = etag
 
-        update_bodies = []
-        update_fields_set: set = set()
+        # Map field name to body key produced by _build_person_body
+        field_to_body_key = {
+            "names": "names",
+            "phoneNumbers": "phoneNumbers",
+            "emailAddresses": "emailAddresses",
+            "organizations": "organizations",
+            "nicknames": "nicknames",
+            "urls": "urls",
+            "userDefined": "userDefined",
+            "relations": "relations",
+            "biographies": "biographies",
+            "addresses": "addresses",
+            "birthdays": "birthdays",
+        }
+        body_key = field_to_body_key[field]
+
+        # Build contacts map (Dict[resourceName, Person]) — required by batchUpdateContacts API
+        contacts_map: Dict[str, Any] = {}
 
         for update in updates:
-            cid = update.get("contact_id", "")
+            cid = update.contact_id
             if not cid.startswith("people/"):
                 cid = f"people/{cid}"
 
@@ -812,34 +1439,43 @@ async def manage_contacts_batch(
                 continue
 
             body = _build_person_body(
-                given_name=update.get("given_name"),
-                family_name=update.get("family_name"),
-                email=update.get("email"),
-                phone=update.get("phone"),
-                organization=update.get("organization"),
-                job_title=update.get("job_title"),
+                given_name=update.given_name,
+                family_name=update.family_name,
+                phones=update.phones,
+                emails=update.emails,
+                organizations=update.organizations,
+                nicknames=update.nicknames,
+                urls=update.urls,
+                user_defined=update.user_defined,
+                relations=update.relations,
+                notes=update.notes,
+                address=update.address,
+                birthday=update.birthday,
+                # deprecated aliases
+                phone=update.phone,
+                email=update.email,
+                organization=update.organization,
+                job_title=update.job_title,
             )
 
-            if body:
-                body["resourceName"] = cid
-                body["etag"] = etag
-                update_bodies.append({"person": body})
+            if body_key not in body:
+                logger.warning(
+                    f"Field '{field}' (key '{body_key}') not present in update for {cid}, skipping"
+                )
+                continue
 
-                if "names" in body:
-                    update_fields_set.add("names")
-                if "emailAddresses" in body:
-                    update_fields_set.add("emailAddresses")
-                if "phoneNumbers" in body:
-                    update_fields_set.add("phoneNumbers")
-                if "organizations" in body:
-                    update_fields_set.add("organizations")
+            person_body = {
+                "etag": etag,
+                body_key: body[body_key],
+            }
+            contacts_map[cid] = person_body
 
-        if not update_bodies:
+        if not contacts_map:
             raise UserInputError("No valid update data provided.")
 
         batch_body = {
-            "contacts": update_bodies,
-            "updateMask": ",".join(update_fields_set),
+            "contacts": contacts_map,
+            "updateMask": field,
             "readMask": DEFAULT_PERSON_FIELDS,
         }
 
@@ -886,7 +1522,15 @@ async def manage_contacts_batch(
     return response
 
 
-@server.tool()
+@server.tool(
+    title="Manage Contact Group",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
 @require_google_service("people", "contacts")
 @handle_http_errors("manage_contact_group", service_type="people")
 async def manage_contact_group(
@@ -896,8 +1540,8 @@ async def manage_contact_group(
     group_id: Optional[str] = None,
     name: Optional[str] = None,
     delete_contacts: bool = False,
-    add_contact_ids: Optional[List[str]] = None,
-    remove_contact_ids: Optional[List[str]] = None,
+    add_contact_ids: Optional[StringList] = None,
+    remove_contact_ids: Optional[StringList] = None,
 ) -> str:
     """
     Create, update, delete a contact group, or modify its members. Consolidated tool

@@ -1,4 +1,5 @@
 import importlib
+from types import SimpleNamespace
 
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -49,6 +50,150 @@ def test_well_known_cache_control_middleware_rewrites_headers():
     assert extra.status_code == 200
     assert extra.headers["cache-control"] == "public, max-age=3600"
     assert "etag" not in extra.headers
+
+
+def test_origin_validation_rejects_untrusted_browser_origin(monkeypatch):
+    from core.server import OriginValidationMiddleware
+
+    monkeypatch.setattr(
+        "auth.oauth_config.get_oauth_config",
+        lambda: SimpleNamespace(
+            get_allowed_origins=lambda: ["http://localhost:8000"],
+            external_url=None,
+        ),
+    )
+
+    async def endpoint(request):
+        return Response("ok")
+
+    app = Starlette(
+        routes=[Route("/health", endpoint)],
+        middleware=[Middleware(OriginValidationMiddleware)],
+    )
+    client = TestClient(app)
+
+    assert (
+        client.get("/health", headers={"Origin": "http://evil.test"}).status_code == 403
+    )
+    assert (
+        client.get("/health", headers={"Origin": "http://localhost:5173"}).status_code
+        == 200
+    )
+    assert client.get("/health").status_code == 200
+
+
+def test_origin_validation_allows_configured_external_origin(monkeypatch):
+    from core.server import OriginValidationMiddleware
+
+    monkeypatch.setattr(
+        "auth.oauth_config.get_oauth_config",
+        lambda: SimpleNamespace(
+            get_allowed_origins=lambda: ["http://localhost:8000"],
+            external_url="https://workspace.example.com/mcp",
+        ),
+    )
+
+    async def endpoint(request):
+        return Response("ok")
+
+    app = Starlette(
+        routes=[Route("/health", endpoint)],
+        middleware=[Middleware(OriginValidationMiddleware)],
+    )
+    client = TestClient(app)
+
+    response = client.get(
+        "/health", headers={"Origin": "https://workspace.example.com"}
+    )
+    assert response.status_code == 200
+
+
+def test_origin_validation_trusts_any_vscode_webview_origin(monkeypatch):
+    from core.server import OriginValidationMiddleware
+
+    # VS Code assigns a fresh, random GUID authority to every webview, so its
+    # origin can never be enumerated in an allowlist. The scheme is the trust
+    # boundary; any vscode-webview origin must be accepted regardless of host.
+    monkeypatch.setattr(
+        "auth.oauth_config.get_oauth_config",
+        lambda: SimpleNamespace(
+            get_allowed_origins=lambda: ["http://localhost:8000"],
+            external_url=None,
+        ),
+    )
+
+    async def endpoint(request):
+        return Response("ok")
+
+    app = Starlette(
+        routes=[Route("/health", endpoint)],
+        middleware=[Middleware(OriginValidationMiddleware)],
+    )
+    client = TestClient(app)
+
+    # Real-world VS Code webview origins carry a unique per-session GUID host.
+    for host in (
+        "1a2b3c4d-5e6f-7a8b-9c0d-1234567890ab",
+        "ffffffff-0000-1111-2222-333344445555",
+        "publisher.extension",
+    ):
+        assert (
+            client.get(
+                "/health", headers={"Origin": f"vscode-webview://{host}"}
+            ).status_code
+            == 200
+        )
+    # A genuine browser web origin that is not configured is still rejected.
+    assert (
+        client.get("/health", headers={"Origin": "https://evil.test"}).status_code
+        == 403
+    )
+
+
+def test_origin_validation_allows_same_origin_request(monkeypatch):
+    from core.server import OriginValidationMiddleware
+
+    # The OAuth proxy consent form posts to itself (action=""), so the request is
+    # always same-origin with the host that served the page. A request whose Origin
+    # matches its own Host must be accepted even if that host was never added to the
+    # allowlist (e.g. WORKSPACE_EXTERNAL_URL unset or misconfigured) — a same-origin
+    # request is the server's own page, never the cross-site threat this guard stops.
+    monkeypatch.setattr(
+        "auth.oauth_config.get_oauth_config",
+        lambda: SimpleNamespace(
+            get_allowed_origins=lambda: ["http://localhost:8000"],
+            external_url=None,
+        ),
+    )
+
+    async def endpoint(request):
+        return Response("ok")
+
+    app = Starlette(
+        routes=[Route("/consent", endpoint, methods=["POST"])],
+        middleware=[Middleware(OriginValidationMiddleware)],
+    )
+    client = TestClient(app)
+
+    # Same-origin consent POST to an unconfigured external host is allowed.
+    same_origin = client.post(
+        "/consent",
+        headers={
+            "Origin": "https://app.example.com",
+            "Host": "app.example.com",
+        },
+    )
+    assert same_origin.status_code == 200
+
+    # A cross-origin request to that same host is still rejected.
+    cross_origin = client.post(
+        "/consent",
+        headers={
+            "Origin": "https://evil.test",
+            "Host": "app.example.com",
+        },
+    )
+    assert cross_origin.status_code == 403
 
 
 def test_configured_server_applies_no_cache_to_served_oauth_discovery_routes(

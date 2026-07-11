@@ -5,9 +5,12 @@ Tests all Apps Script tools with mocked API responses
 """
 
 import pytest
+from typing import get_type_hints
 from unittest.mock import Mock
 import sys
 import os
+
+from pydantic import TypeAdapter
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
@@ -29,7 +32,30 @@ from gappsscript.apps_script_tools import (
     _get_version_impl,
     _get_script_metrics_impl,
     _generate_trigger_code_impl,
+    manage_deployment,
+    run_script_function,
 )
+
+
+def _parameters_adapter():
+    hint = get_type_hints(run_script_function, include_extras=True)["parameters"]
+    return TypeAdapter(hint)
+
+
+def test_run_script_function_parameters_coerces_json_string():
+    """A JSON-encoded array string is parsed into a real list."""
+    assert _parameters_adapter().validate_python('["PrestaShop"]') == ["PrestaShop"]
+
+
+def test_run_script_function_parameters_accepts_native_list():
+    """Native lists (including heterogeneous items) pass through unchanged."""
+    payload = ["PrestaShop", 1, {"a": 2}]
+    assert _parameters_adapter().validate_python(payload) == payload
+
+
+def test_run_script_function_parameters_accepts_none():
+    """``parameters`` is optional."""
+    assert _parameters_adapter().validate_python(None) is None
 
 
 @pytest.mark.asyncio
@@ -212,11 +238,14 @@ async def test_list_deployments():
 
 @pytest.mark.asyncio
 async def test_update_deployment():
-    """Test updating deployment"""
+    """Test updating deployment wraps fields in deploymentConfig (issue #836)."""
     mock_service = Mock()
     mock_response = {
         "deploymentId": "deploy123",
-        "description": "Updated description",
+        "deploymentConfig": {
+            "scriptId": "test123",
+            "description": "Updated description",
+        },
     }
 
     mock_service.projects().deployments().update().execute.return_value = mock_response
@@ -229,7 +258,91 @@ async def test_update_deployment():
         description="Updated description",
     )
 
+    # The Apps Script API rejects a flat body; fields must live under
+    # ``deploymentConfig`` and the config must always carry ``scriptId``.
+    _, update_kwargs = mock_service.projects().deployments().update.call_args
+    assert update_kwargs["scriptId"] == "test123"
+    assert update_kwargs["deploymentId"] == "deploy123"
+    assert update_kwargs["body"] == {
+        "deploymentConfig": {
+            "scriptId": "test123",
+            "description": "Updated description",
+        }
+    }
+    assert "description" not in update_kwargs["body"]
+
     assert "Updated deployment: deploy123" in result
+    assert "Updated description" in result
+
+
+@pytest.mark.asyncio
+async def test_update_deployment_with_version_number():
+    """Updating with a version_number repoints the deployment (issue #836)."""
+    mock_service = Mock()
+    mock_response = {
+        "deploymentId": "deploy123",
+        "deploymentConfig": {
+            "scriptId": "test123",
+            "versionNumber": 2,
+            "description": "v2 - updated layout",
+        },
+    }
+
+    mock_service.projects().deployments().update().execute.return_value = mock_response
+
+    result = await _update_deployment_impl(
+        service=mock_service,
+        user_google_email="test@example.com",
+        script_id="test123",
+        deployment_id="deploy123",
+        description="v2 - updated layout",
+        version_number=2,
+    )
+
+    _, update_kwargs = mock_service.projects().deployments().update.call_args
+    assert update_kwargs["body"] == {
+        "deploymentConfig": {
+            "scriptId": "test123",
+            "versionNumber": 2,
+            "description": "v2 - updated layout",
+        }
+    }
+
+    assert "Version: 2" in result
+    assert "v2 - updated layout" in result
+
+
+@pytest.mark.asyncio
+async def test_manage_deployment_update_allows_version_number_without_description():
+    """The public update branch allows roll-forward updates without a description."""
+    mock_service = Mock()
+    mock_response = {
+        "deploymentId": "deploy123",
+        "deploymentConfig": {
+            "scriptId": "test123",
+            "versionNumber": 2,
+        },
+    }
+    mock_service.projects().deployments().update().execute.return_value = mock_response
+
+    undecorated_manage_deployment = manage_deployment.__wrapped__.__wrapped__
+    result = await undecorated_manage_deployment(
+        service=mock_service,
+        user_google_email="test@example.com",
+        action="update",
+        script_id="test123",
+        deployment_id="deploy123",
+        version_number=2,
+    )
+
+    _, update_kwargs = mock_service.projects().deployments().update.call_args
+    assert update_kwargs["body"] == {
+        "deploymentConfig": {
+            "scriptId": "test123",
+            "versionNumber": 2,
+        }
+    }
+    assert "Version: 2" in result
 
 
 @pytest.mark.asyncio

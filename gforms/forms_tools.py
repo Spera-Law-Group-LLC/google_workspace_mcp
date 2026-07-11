@@ -10,6 +10,8 @@ import json
 from typing import List, Optional, Dict, Any
 
 
+from mcp.types import ToolAnnotations
+
 from auth.service_decorator import require_google_service
 from core.server import server
 from core.utils import handle_http_errors
@@ -116,7 +118,15 @@ def _serialize_form_item(item: Dict[str, Any], index: int) -> Dict[str, Any]:
     return serialized_item
 
 
-@server.tool()
+@server.tool(
+    title="Create Form",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("create_form", service_type="forms")
 @require_google_service("forms", "forms")
 async def create_form(
@@ -163,7 +173,15 @@ async def create_form(
     return confirmation_message
 
 
-@server.tool()
+@server.tool(
+    title="Get Form",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("get_form", is_read_only=True, service_type="forms")
 @require_google_service("forms", "forms")
 async def get_form(service, user_google_email: str, form_id: str) -> str:
@@ -227,15 +245,23 @@ async def get_form(service, user_google_email: str, form_id: str) -> str:
     return result
 
 
-@server.tool()
+@server.tool(
+    title="Set Publish Settings",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("set_publish_settings", service_type="forms")
 @require_google_service("forms", "forms")
 async def set_publish_settings(
     service,
     user_google_email: str,
     form_id: str,
-    publish_as_template: bool = False,
-    require_authentication: bool = False,
+    is_published: bool = True,
+    is_accepting_responses: bool = True,
 ) -> str:
     """
     Updates the publish settings of a form.
@@ -243,8 +269,8 @@ async def set_publish_settings(
     Args:
         user_google_email (str): The user's Google email address. Required.
         form_id (str): The ID of the form to update publish settings for.
-        publish_as_template (bool): Whether to publish as a template. Defaults to False.
-        require_authentication (bool): Whether to require authentication to view/submit. Defaults to False.
+        is_published (bool): Whether the form is published and visible to responders. Defaults to True.
+        is_accepting_responses (bool): Whether the form accepts responses. Only takes effect when the form is published. Defaults to True.
 
     Returns:
         str: Confirmation message of the successful publish settings update.
@@ -254,22 +280,35 @@ async def set_publish_settings(
     )
 
     settings_body = {
-        "publishAsTemplate": publish_as_template,
-        "requireAuthentication": require_authentication,
+        "publishSettings": {
+            "publishState": {
+                "isPublished": is_published,
+                "isAcceptingResponses": is_accepting_responses,
+            }
+        },
+        "updateMask": "publishState.isPublished,publishState.isAcceptingResponses",
     }
 
     await asyncio.to_thread(
         service.forms().setPublishSettings(formId=form_id, body=settings_body).execute
     )
 
-    confirmation_message = f"Successfully updated publish settings for form {form_id} for {user_google_email}. Publish as template: {publish_as_template}, Require authentication: {require_authentication}"
+    confirmation_message = f"Successfully updated publish settings for form {form_id} for {user_google_email}. Published: {is_published}, Accepting responses: {is_accepting_responses}"
     logger.info(
         f"Publish settings updated successfully for {user_google_email}. Form ID: {form_id}"
     )
     return confirmation_message
 
 
-@server.tool()
+@server.tool(
+    title="Get Form Response",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("get_form_response", is_read_only=True, service_type="forms")
 @require_google_service("forms", "forms")
 async def get_form_response(
@@ -324,7 +363,15 @@ async def get_form_response(
     return result
 
 
-@server.tool()
+@server.tool(
+    title="List Form Responses",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("list_form_responses", is_read_only=True, service_type="forms")
 @require_google_service("forms", "forms")
 async def list_form_responses(
@@ -445,7 +492,15 @@ async def _batch_update_form_impl(
     return confirmation_message
 
 
-@server.tool()
+@server.tool(
+    title="Batch Update Form",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("batch_update_form", service_type="forms")
 @require_google_service("forms", "forms")
 async def batch_update_form(
